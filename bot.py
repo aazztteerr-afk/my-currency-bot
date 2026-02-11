@@ -5,72 +5,89 @@ from flask import Flask
 from threading import Thread
 from datetime import datetime, timedelta
 
-# Твій токен
+# Налаштування
 TOKEN = '8048666406:AAGuIA7o4lYNjVtpF_gy_Rm1sq34xukPzlI'
 bot = telebot.TeleBot(TOKEN)
-
-# Веб-сервер для Render (щоб не засинав)
 app = Flask('')
 
 @app.route('/')
 def home():
-    return "Bot is alive!"
+    return "Finance Bot is active!"
 
 def run():
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
-# Функція: дізнатися курс за конкретну дату
-def get_usd_rate(date_obj):
-    date_str = date_obj.strftime("%Y%m%d") # перетворюємо дату у формат 20231025
-    url = f"https://bank.gov.ua/NBUStatService/v1/statdirectory/exchange?date={date_str}&json"
-    response = requests.get(url).json()
-    for item in response:
-        if item['cc'] == 'USD':
-            return item['rate']
-    return 0
-
-@bot.message_handler(commands=['start', 'rate'])
-def analytics(message):
+# 1. Отримання курсу НБУ (Офіційний)
+def get_nbu_rate():
+    url = "https://bank.gov.ua/NBUStatService/v1/statdirectory/exchange?json"
     try:
-        # 1. Беремо дати
-        today = datetime.now()
-        yesterday = today - timedelta(days=1)
+        response = requests.get(url).json()
+        for item in response:
+            if item['cc'] == 'USD':
+                return item['rate']
+    except:
+        return None
 
-        # 2. Беремо курси
-        rate_today = get_usd_rate(today)
-        rate_yesterday = get_usd_rate(yesterday)
+# 2. Отримання готівкового курсу (Обмінники/Банки)
+# Використовуємо відкрите API Monobank або аналогічні джерела для реального ринку
+def get_market_rate():
+    url = "https://api.monobank.ua/bank/currency"
+    try:
+        response = requests.get(url).json()
+        # Код валюти 840 - USD, 980 - UAH
+        for item in response:
+            if item['currencyCodeA'] == 840 and item['currencyCodeB'] == 980:
+                return {
+                    'buy': item['rateBuy'],
+                    'sell': item['rateSell']
+                }
+    except:
+        return None
 
-        if rate_today == 0 or rate_yesterday == 0:
-            bot.send_message(message.chat.id, "Помилка НБУ. Спробуйте пізніше.")
-            return
+@bot.message_handler(commands=['start', 'rate', 'p'])
+def send_analytics(message):
+    bot.send_chat_action(message.chat.id, 'typing')
+    
+    nbu = get_nbu_rate()
+    market = get_market_rate()
+    
+    if not nbu or not market:
+        bot.send_message(message.chat.id, "❌ Помилка отримання даних. Спробуйте через хвилину.")
+        return
 
-        # 3. Аналізуємо різницю
-        diff = rate_today - rate_yesterday
-        
-        # Логіка порад
-        if diff > 0.05:
-            trend = "📈 **Тренд: Долар дорожчає!**"
-            advice = "🔴 **ПОРАДА:** Краще зачекати. Курс пішов вгору порівняно з вчорашнім днем."
-        elif diff < -0.05:
-            trend = "📉 **Тренд: Долар падає!**"
-            advice = "🟢 **ПОРАДА:** Гарний момент для купівлі! Гривня зміцнилася."
-        else:
-            trend = "⚖️ **Тренд: Стабільність.**"
-            advice = "🟡 **ПОРАДА:** Курс майже не змінився. Можна купувати/продавати у звичному режимі."
+    # Розрахунок спреду (різниця між купівлею та продажем)
+    spread = market['sell'] - market['buy']
+    
+    # Аналітична логіка
+    # Якщо курс продажу в обміннику значно вищий за НБУ (> 0.60 грн) — це "перегрітий" ринок
+    diff_nbu_market = market['sell'] - nbu
+    
+    if diff_nbu_market > 0.70:
+        trend = "⚠️ **РИНОК ПЕРЕГРІТИЙ**"
+        advice = "🔴 **ПОРАДА:** В обмінниках курс занадто завищений відносно НБУ. Краще **зачекати 2 дні**, поки спред зменшиться."
+    elif spread > 0.40:
+        trend = "📉 **ВИСОКА ВОЛАТИЛЬНІСТЬ**"
+        advice = "🟡 **ПОРАДА:** Велика різниця між купівлею та продажем. Ринок нервує. Купуйте тільки якщо дуже потрібно."
+    else:
+        trend = "✅ **РИНОК СТАБІЛЬНИЙ**"
+        advice = "🟢 **ПОРАДА:** Курс адекватний. Можна купувати зараз."
 
-        # 4. Формуємо красиву відповідь
-        text = (
-            f"💵 **Курс сьогодні:** {rate_today:.2f} грн\n"
-            f"🗓 **Курс вчора:** {rate_yesterday:.2f} грн\n"
-            f"📊 **Зміна за добу:** {diff:+.2f} грн\n\n"
-            f"{trend}\n{advice}"
-        )
-        
-        bot.send_message(message.chat.id, text, parse_mode='Markdown')
+    response_text = (
+        f"📊 **АНАЛІЗ РИНКУ ВАЛЮТ**\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"🏛 **Курс НБУ:** `{nbu:.2f} грн`\n\n"
+        f"💰 **Готівковий ринок (Mono):**\n"
+        f"  • Купівля: `{market['buy']:.2f} грн`\n"
+        f"  • Продаж:  `{market['sell']:.2f} грн`\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"{trend}\n\n"
+        f"{advice}\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"_Оновлено: {datetime.now().strftime('%H:%M:%S')}_"
+    )
 
-    except Exception as e:
-        bot.send_message(message.chat.id, f"❌ Щось пішло не так: {e}")
+    bot.send_message(message.chat.id, response_text, parse_mode='Markdown')
 
 if __name__ == "__main__":
     Thread(target=run).start()
