@@ -1,94 +1,92 @@
 import telebot
 import requests
 import os
+import time
 from flask import Flask
 from threading import Thread
-from datetime import datetime, timedelta
+from datetime import datetime
 
 # Налаштування
 TOKEN = '8048666406:AAGuIA7o4lYNjVtpF_gy_Rm1sq34xukPzlI'
 bot = telebot.TeleBot(TOKEN)
 app = Flask('')
 
-@app.route('/')
-def home():
-    return "Finance Bot is active!"
+# Сховище для підписок (в реалі краще використовувати БД)
+alerts = {} 
 
-def run():
+@app.route('/')
+def home(): return "Bot is running!"
+
+def run_web():
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
-# 1. Отримання курсу НБУ (Офіційний)
-def get_nbu_rate():
-    url = "https://bank.gov.ua/NBUStatService/v1/statdirectory/exchange?json"
+def get_rates():
+    """Отримує дані НБУ та ринку одночасно"""
     try:
-        response = requests.get(url).json()
-        for item in response:
-            if item['cc'] == 'USD':
-                return item['rate']
-    except:
+        nbu_url = "https://bank.gov.ua/NBUStatService/v1/statdirectory/exchange?json"
+        mono_url = "https://api.monobank.ua/bank/currency"
+        
+        nbu_res = requests.get(nbu_url).json()
+        mono_res = requests.get(mono_url).json()
+        
+        nbu_usd = next(item['rate'] for item in nbu_res if item['cc'] == 'USD')
+        mono_usd = next(item for item in mono_res if item['currencyCodeA'] == 840 and item['currencyCodeB'] == 980)
+        
+        return {
+            'nbu': nbu_usd,
+            'buy': mono_usd['rateBuy'],
+            'sell': mono_usd['rateSell']
+        }
+    except Exception as e:
+        print(f"Помилка даних: {e}")
         return None
 
-# 2. Отримання готівкового курсу (Обмінники/Банки)
-# Використовуємо відкрите API Monobank або аналогічні джерела для реального ринку
-def get_market_rate():
-    url = "https://api.monobank.ua/bank/currency"
+# Команда для встановлення ціни-сповіщення: /set 41.50
+@bot.message_handler(commands=['set'])
+def set_alert(message):
     try:
-        response = requests.get(url).json()
-        # Код валюти 840 - USD, 980 - UAH
-        for item in response:
-            if item['currencyCodeA'] == 840 and item['currencyCodeB'] == 980:
-                return {
-                    'buy': item['rateBuy'],
-                    'sell': item['rateSell']
-                }
+        target_price = float(message.text.split()[1].replace(',', '.'))
+        alerts[message.chat.id] = target_price
+        bot.reply_to(message, f"🎯 Ок! Я напишу, щойно курс продажу впаде до **{target_price} грн**.")
     except:
-        return None
+        bot.reply_to(message, "⚠️ Напишіть ціну у форматі: `/set 41.20`", parse_mode='Markdown')
 
-@bot.message_handler(commands=['start', 'rate', 'p'])
-def send_analytics(message):
-    bot.send_chat_action(message.chat.id, 'typing')
-    
-    nbu = get_nbu_rate()
-    market = get_market_rate()
-    
-    if not nbu or not market:
-        bot.send_message(message.chat.id, "❌ Помилка отримання даних. Спробуйте через хвилину.")
+@bot.message_handler(commands=['start', 'rate'])
+def check_rate(message):
+    data = get_rates()
+    if not data:
+        bot.send_message(message.chat.id, "❌ Помилка зв'язку з банками.")
         return
 
-    # Розрахунок спреду (різниця між купівлею та продажем)
-    spread = market['sell'] - market['buy']
+    # Логіка "зачекати 2 дні"
+    diff = data['sell'] - data['nbu']
+    advice = "🟢 Можна купувати." if diff < 0.6 else "🔴 Дорого! Різниця з НБУ велика, краще зачекати 2 дні."
     
-    # Аналітична логіка
-    # Якщо курс продажу в обміннику значно вищий за НБУ (> 0.60 грн) — це "перегрітий" ринок
-    diff_nbu_market = market['sell'] - nbu
-    
-    if diff_nbu_market > 0.70:
-        trend = "⚠️ **РИНОК ПЕРЕГРІТИЙ**"
-        advice = "🔴 **ПОРАДА:** В обмінниках курс занадто завищений відносно НБУ. Краще **зачекати 2 дні**, поки спред зменшиться."
-    elif spread > 0.40:
-        trend = "📉 **ВИСОКА ВОЛАТИЛЬНІСТЬ**"
-        advice = "🟡 **ПОРАДА:** Велика різниця між купівлею та продажем. Ринок нервує. Купуйте тільки якщо дуже потрібно."
-    else:
-        trend = "✅ **РИНОК СТАБІЛЬНИЙ**"
-        advice = "🟢 **ПОРАДА:** Курс адекватний. Можна купувати зараз."
-
-    response_text = (
-        f"📊 **АНАЛІЗ РИНКУ ВАЛЮТ**\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"🏛 **Курс НБУ:** `{nbu:.2f} грн`\n\n"
-        f"💰 **Готівковий ринок (Mono):**\n"
-        f"  • Купівля: `{market['buy']:.2f} грн`\n"
-        f"  • Продаж:  `{market['sell']:.2f} грн`\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"{trend}\n\n"
-        f"{advice}\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"_Оновлено: {datetime.now().strftime('%H:%M:%S')}_"
+    text = (
+        f"🏛 НБУ: `{data['nbu']:.2f}`\n"
+        f"💰 Ринок: `{data['buy']:.2f} / {data['sell']:.2f}`\n\n"
+        f"📢 **Порада:** {advice}"
     )
+    bot.send_message(message.chat.id, text, parse_mode='Markdown')
 
-    bot.send_message(message.chat.id, response_text, parse_mode='Markdown')
+# Фонова перевірка курсу для сповіщень
+def alert_checker():
+    while True:
+        try:
+            data = get_rates()
+            if data:
+                current_sell = data['sell']
+                for chat_id, target in list(alerts.items()):
+                    if current_sell <= target:
+                        bot.send_message(chat_id, f"🔔 **ЧАС КУПУВАТИ!**\nКурс впав до `{current_sell:.2f}` (ваша ціль: {target})", parse_mode='Markdown')
+                        del alerts[chat_id] # Видаляємо після спрацювання
+            time.sleep(600) # Перевіряти кожні 10 хвилин
+        except Exception as e:
+            print(f"Alert error: {e}")
+            time.sleep(60)
 
 if __name__ == "__main__":
-    Thread(target=run).start()
+    Thread(target=run_web).start()
+    Thread(target=alert_checker).start()
     bot.infinity_polling()
